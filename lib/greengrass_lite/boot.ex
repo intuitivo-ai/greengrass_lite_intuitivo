@@ -3,9 +3,13 @@ defmodule GreenGrassLite.Boot do
 
   require Logger
 
-  @config_path "/home/ggc_user/config.yaml"
-  @config_dir "/home/ggc_user/config.d"
-  @logs_dir "/home/ggc_user/logs"
+  defp ggc_root do
+    Application.get_env(:greengrass_lite, :ggc_root, "/home/ggc_user")
+  end
+
+  defp config_path, do: Path.join(ggc_root(), "config.yaml")
+  defp config_dir, do: Path.join(ggc_root(), "config.d")
+  defp logs_dir, do: Path.join(ggc_root(), "logs")
 
   @doc """
   Runs before Nucleus Lite daemons start: `/dev/fd` symlink and optional `config.yaml` normalization.
@@ -21,17 +25,17 @@ defmodule GreenGrassLite.Boot do
   Safe to call from host apps after writing new YAML (e.g. credential refresh).
   """
   def ensure_lite_config_yaml_on_disk do
-    _ = File.mkdir_p(@config_dir)
-    _ = File.mkdir_p(@logs_dir)
+    _ = File.mkdir_p(config_dir())
+    _ = File.mkdir_p(logs_dir())
 
-    case File.read(@config_path) do
+    case File.read(config_path()) do
       {:ok, content} ->
         new_content = normalize_config_yaml_string(content)
 
         if new_content != content do
-          case File.write(@config_path, new_content) do
+          case File.write(config_path(), new_content) do
             :ok ->
-              Logger.info("GREENGRASS_LITE_CONFIG_BOOT_NORMALIZED #{@config_path}")
+              Logger.info("GREENGRASS_LITE_CONFIG_BOOT_NORMALIZED #{config_path()}")
 
             {:error, reason} ->
               Logger.warning("GREENGRASS_LITE_CONFIG_BOOT_WRITE_FAILED #{inspect(reason)}")

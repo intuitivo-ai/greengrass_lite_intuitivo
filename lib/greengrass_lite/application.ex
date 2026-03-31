@@ -7,9 +7,13 @@ defmodule GreenGrassLite.Application do
   def start(_type, _args) do
     children =
       if autostart?() do
-        :ok = GreenGrassLite.Boot.setup!()
-        sup_opts = Application.get_env(:greengrass_lite, :supervisor_opts, [])
-        [{GreenGrassLite.Supervisor, sup_opts}]
+        [
+          {DynamicSupervisor,
+           name: GreenGrassLite.DaemonDynamicSupervisor,
+           strategy: :one_for_one,
+           max_children: 1},
+          {GreenGrassLite.Launcher, []}
+        ]
       else
         [{GreenGrassLite.Idle, []}]
       end

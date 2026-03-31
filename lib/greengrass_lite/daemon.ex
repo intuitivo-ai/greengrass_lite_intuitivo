@@ -2,17 +2,26 @@ defmodule GreenGrassLite.Daemon do
   @moduledoc """
   GenServer that manages a single greengrass-lite daemon process via `Port`.
 
-  Stdout/stderr are appended to `/home/ggc_user/logs/<name>.log` (same layout idea
-  as classic Greengrass under the GG root `logs/` directory). Each complete line
-  is also logged with `Logger.info/1` so RingLogger and other backends see the
-  stream at the default level.
+  Stdout/stderr are always appended to `<ggc_root>/logs/<name>.log` (default
+  `ggc_root` `/home/ggc_user`). By default
+  that stream is **not** duplicated into Elixir `Logger` (too verbose). Enable with:
+
+      config :greengrass_lite, forward_daemon_logs_to_logger: true
+      # optional: :debug | :info | :warning
+      config :greengrass_lite, forward_daemon_log_level: :info
+      # when forwarding, skip C lines starting with T[ / D[ (trace/debug), e.g. MQTT pings
+      config :greengrass_lite, forward_daemon_logs_skip_c_debug: true
   """
 
   use GenServer
   require Logger
 
-  @log_dir "/home/ggc_user/logs"
-  @work_dir "/home/ggc_user"
+  defp ggc_root do
+    Application.get_env(:greengrass_lite, :ggc_root, "/home/ggc_user")
+  end
+
+  defp log_dir, do: Path.join(ggc_root(), "logs")
+  defp work_dir, do: ggc_root()
   # Core-bus socket created by ggconfigd; others must not start until it exists.
   @gg_config_socket "/run/greengrass/gg_config"
   @gg_config_wait_attempts 300
@@ -39,7 +48,7 @@ defmodule GreenGrassLite.Daemon do
 
   @impl true
   def init({name, bin, args}) do
-    Logger.info("GREENGRASS_LITE_DAEMON_STARTING #{name}")
+    Logger.debug("GREENGRASS_LITE_DAEMON_STARTING #{name}")
 
     case File.exists?(bin) do
       true ->
@@ -126,7 +135,7 @@ defmodule GreenGrassLite.Daemon do
         :exit_status,
         :use_stdio,
         :stderr_to_stdout,
-        cd: String.to_charlist(@work_dir),
+        cd: String.to_charlist(work_dir()),
         args: args
       ])
 
@@ -155,7 +164,7 @@ defmodule GreenGrassLite.Daemon do
 
   defp wait_for_gg_config_socket(n) when n > 0 do
     if File.exists?(@gg_config_socket) do
-      Logger.info("GREENGRASS_LITE_GGCONFIG_SOCKET_READY #{@gg_config_socket}")
+      Logger.debug("GREENGRASS_LITE_GGCONFIG_SOCKET_READY #{@gg_config_socket}")
     else
       Process.sleep(@gg_config_poll_ms)
       wait_for_gg_config_socket(n - 1)
@@ -178,7 +187,7 @@ defmodule GreenGrassLite.Daemon do
 
   @impl true
   def terminate(_reason, %{port: port, name: name, log_io: log_io}) do
-    Logger.info("GREENGRASS_LITE_DAEMON_TERMINATING #{name}")
+    Logger.debug("GREENGRASS_LITE_DAEMON_TERMINATING #{name}")
     close_log_io(log_io)
 
     if port != nil do
@@ -198,8 +207,9 @@ defmodule GreenGrassLite.Daemon do
   end
 
   defp open_daemon_log(name) do
-    File.mkdir_p!(@log_dir)
-    path = Path.join(@log_dir, "#{Atom.to_string(name)}.log")
+    dir = log_dir()
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "#{Atom.to_string(name)}.log")
 
     case File.open(path, [:append, :binary]) do
       {:ok, io} ->
@@ -221,9 +231,21 @@ defmodule GreenGrassLite.Daemon do
   end
 
   defp log_daemon_lines(name, data) when is_binary(data) do
-    for line <- String.split(data, "\n", trim: true) do
-      Logger.info("[#{name}] #{line}")
+    if Application.get_env(:greengrass_lite, :forward_daemon_logs_to_logger, false) do
+      level = Application.get_env(:greengrass_lite, :forward_daemon_log_level, :info)
+      skip_debug? = Application.get_env(:greengrass_lite, :forward_daemon_logs_skip_c_debug, true)
+
+      for line <- String.split(data, "\n", trim: true),
+          not (skip_debug? and c_stdout_debug_or_trace?(line)) do
+        Logger.log(level, "[#{name}] #{line}")
+      end
     end
+  end
+
+  # Greengrass Nucleus Lite prints e.g. "D[iotcored] mqtt.c:420: ..." / "T[...]" on stdout.
+  defp c_stdout_debug_or_trace?(line) do
+    t = String.trim_leading(line)
+    String.starts_with?(t, "D[") or String.starts_with?(t, "T[")
   end
 
   defp close_log_io(nil), do: :ok

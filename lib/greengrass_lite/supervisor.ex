@@ -16,12 +16,16 @@ defmodule GreenGrassLite.Supervisor do
 
   use Supervisor
 
-  @default_opts %{
-    config_path: "/home/ggc_user/config.yaml",
-    config_dir: "/home/ggc_user/config.d",
-    root_path: "/home/ggc_user",
-    bin_dir: "/usr/bin"
-  }
+  defp default_paths do
+    root = Application.get_env(:greengrass_lite, :ggc_root, "/home/ggc_user")
+
+    %{
+      config_path: Path.join(root, "config.yaml"),
+      config_dir: Path.join(root, "config.d"),
+      root_path: root,
+      bin_dir: "/usr/bin"
+    }
+  end
 
   def start_link(opts \\ []) do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
@@ -29,7 +33,8 @@ defmodule GreenGrassLite.Supervisor do
 
   @impl true
   def init(opts) do
-    config = Map.merge(@default_opts, Map.new(opts))
+    env_opts = Application.get_env(:greengrass_lite, :supervisor_opts, [])
+    config = default_paths() |> Map.merge(Map.new(env_opts)) |> Map.merge(Map.new(opts))
 
     children = [
       daemon_spec(:ggconfigd, config, ["-c", config.config_path, "-C", config.config_dir]),

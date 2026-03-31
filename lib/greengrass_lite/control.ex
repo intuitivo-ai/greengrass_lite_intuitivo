@@ -2,17 +2,25 @@ defmodule GreenGrassLite.Control do
   @moduledoc """
   Enable/disable/status control for greengrass-lite.
   Uses a control file to persist desired state across reboots.
+
+  Override path in tests or custom images:
+
+      config :greengrass_lite, control_file: \"/data/.greengrass_control.txt\"
   """
 
   require Logger
 
-  @control_file "/root/.greengrass_control.txt"
+  @default_control_file "/root/.greengrass_control.txt"
+
+  defp control_file_path do
+    Application.get_env(:greengrass_lite, :control_file, @default_control_file)
+  end
 
   @doc """
   Returns the current status: :enabled, :disabled, or :unknown.
   """
   def status do
-    case File.read(@control_file) do
+    case File.read(control_file_path()) do
       {:ok, content} ->
         content = String.trim(content)
 
@@ -35,21 +43,56 @@ defmodule GreenGrassLite.Control do
   Enables greengrass-lite. Daemons will be started on next boot.
   """
   def enable do
-    File.write(@control_file, "enabled")
+    File.write(control_file_path(), "enabled")
   end
 
   @doc """
   Disables greengrass-lite. Daemons will not start on next boot.
   """
   def disable do
-    File.write(@control_file, "disabled")
+    File.write(control_file_path(), "disabled")
   end
 
   @doc """
-  Returns true if greengrass-lite is enabled.
+  Returns true unless the control file explicitly disables Lite (`disabled` / `0`).
+
+  Matches firmware default: anything other than an explicit disable is treated as enabled.
   """
   def enabled? do
-    status() == :enabled
+    status() != :disabled
+  end
+
+  @doc """
+  Snapshot for operations dashboards: credentials, process state, and a heuristic
+  for IoT Core MQTT (`iotcored` log: \"Connected to IoT core at …\").
+
+  `mqtt` is `:inactive` (no iotcored), `:pending`, `:connected`, or `:disconnected`.
+  """
+  def runtime_status do
+    creds = GreenGrassLite.Credentials.ready?()
+    sup = Process.whereis(GreenGrassLite.Supervisor)
+    daemons = daemon_status()
+    all_alive =
+      creds && map_size(daemons) > 0 && Enum.all?(daemons, fn {_, alive?} -> alive? end)
+
+    iotcored_up = sup != nil && Map.get(daemons, :iotcored, false)
+
+    mqtt =
+      if iotcored_up do
+        root = Application.get_env(:greengrass_lite, :ggc_root, "/home/ggc_user")
+        GreenGrassLite.MqttHint.from_log_file(Path.join(root, "logs/iotcored.log"))
+      else
+        :inactive
+      end
+
+    %{
+      enabled: enabled?(),
+      credentials_ready: creds,
+      supervisor_started: sup != nil,
+      daemons: daemons,
+      all_daemons_alive: all_alive,
+      mqtt: mqtt
+    }
   end
 
   @doc """

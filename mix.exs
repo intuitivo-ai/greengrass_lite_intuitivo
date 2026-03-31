@@ -1,7 +1,7 @@
 defmodule GreenGrassLite.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.1"
 
   def project do
     [
@@ -16,7 +16,8 @@ defmodule GreenGrassLite.MixProject do
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {GreenGrassLite.Application, []}
     ]
   end
 

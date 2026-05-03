@@ -41,14 +41,20 @@ defmodule GreenGrassLite.Control do
 
   @doc """
   Enables greengrass-lite. Daemons will be started on next boot.
+
+  Returns `:ok` or `{:error, reason}` from `File.write/2` (e.g. `:enospc` if `/root` is full).
   """
+  @spec enable() :: :ok | {:error, File.posix() | :badarg | :terminated}
   def enable do
     File.write(control_file_path(), "enabled")
   end
 
   @doc """
   Disables greengrass-lite. Daemons will not start on next boot.
+
+  Returns `:ok` or `{:error, reason}` from `File.write/2` (e.g. `:enospc` if `/root` is full).
   """
+  @spec disable() :: :ok | {:error, File.posix() | :badarg | :terminated}
   def disable do
     File.write(control_file_path(), "disabled")
   end

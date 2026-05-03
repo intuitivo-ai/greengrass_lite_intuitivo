@@ -103,7 +103,7 @@ defmodule GreenGrassLite.Daemon do
 
   @impl true
   def handle_info({port, {:data, data}}, %{port: port, name: name} = state) do
-    write_daemon_log(state.log_io, data)
+    write_daemon_log(name, state.log_io, data)
     log_daemon_lines(name, data)
     {:noreply, state}
   end
@@ -224,10 +224,41 @@ defmodule GreenGrassLite.Daemon do
     end
   end
 
-  defp write_daemon_log(nil, _data), do: :ok
+  defp write_daemon_log(_name, nil, _data), do: :ok
 
-  defp write_daemon_log(io, data) when is_binary(data) do
-    IO.binwrite(io, data)
+  # Use :file.write/2 instead of IO.binwrite/2: the latter raises on {:error, reason}
+  # (e.g. :enospc when /home/ggc_user or the log volume is full), which kills the GenServer
+  # and restarts daemons in a tight loop without fixing the underlying disk issue.
+  defp write_daemon_log(name, io, data) when is_binary(data) do
+    case :file.write(io, data) do
+      :ok ->
+        :ok
+
+      {:error, :enospc} ->
+        log_enospc_once(name)
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "GREENGRASS_LITE_DAEMON_LOG_WRITE_FAILED daemon=#{name} reason=#{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp log_enospc_once(name) do
+    key = {:greengrass_lite_daemon, :enospc_logged, name}
+
+    unless Process.get(key) do
+      Process.put(key, true)
+
+      Logger.error(
+        "GREENGRASS_LITE_DAEMON_LOG_ENOSPC daemon=#{name} dir=#{log_dir()} — " <>
+          "no space left on device while appending daemon log; chunks are dropped until space is freed. " <>
+          "Prune #{log_dir()}/*.log or enlarge the partition (df -h /home/ggc_user)."
+      )
+    end
   end
 
   defp log_daemon_lines(name, data) when is_binary(data) do

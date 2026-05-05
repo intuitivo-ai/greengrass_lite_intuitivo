@@ -2,9 +2,20 @@ defmodule GreenGrassLite.Daemon do
   @moduledoc """
   GenServer that manages a single greengrass-lite daemon process via `Port`.
 
-  Stdout/stderr are always appended to `<ggc_root>/logs/<name>.log` (default
-  `ggc_root` `/home/ggc_user`). By default
-  that stream is **not** duplicated into Elixir `Logger` (too verbose). Enable with:
+  Daemon stdout/stderr is **disabled by default** — `GreenGrassLite.Control.logs_status/0`
+  must be `:enabled` for chunks to be written to `<ggc_root>/logs/<name>.log`
+  (default `ggc_root` `/home/ggc_user`). Toggle live with
+  `GreenGrassLite.Control.enable_logs/0` / `disable_logs/0`; running daemons
+  reopen or close their log files on the next cast without a restart.
+
+  A small whitelist of daemons keeps logging even when the control is `disabled`
+  because their log file is read by the runtime (e.g. `iotcored.log` powers MQTT
+  state detection in `GreenGrassLite.Control.runtime_status/0`). Override with:
+
+      config :greengrass_lite, always_on_log_daemons: [:iotcored]
+
+  By default the stream is also **not** duplicated into Elixir `Logger`
+  (too verbose). Enable with:
 
       config :greengrass_lite, forward_daemon_logs_to_logger: true
       # optional: :debug | :info | :warning
@@ -12,8 +23,9 @@ defmodule GreenGrassLite.Daemon do
       # when forwarding, skip C lines starting with T[ / D[ (trace/debug), e.g. MQTT pings
       config :greengrass_lite, forward_daemon_logs_skip_c_debug: true
 
-  Daemon logs are rotated by size to bound disk usage. Defaults: 5 MB per
-  file, 1 archived generation (`<name>.log` + `<name>.log.1`). Override with:
+  When logging is active, daemon logs are rotated by size to bound disk usage.
+  Defaults: 5 MB per file, 1 archived generation (`<name>.log` + `<name>.log.1`).
+  Override with:
 
       config :greengrass_lite, daemon_log_max_bytes: 5 * 1024 * 1024
       config :greengrass_lite, daemon_log_keep: 1
@@ -35,12 +47,26 @@ defmodule GreenGrassLite.Daemon do
 
   @default_log_max_bytes 5 * 1024 * 1024
   @default_log_keep 1
+  @default_always_on_log_daemons [:iotcored]
 
   defp log_max_bytes,
     do: Application.get_env(:greengrass_lite, :daemon_log_max_bytes, @default_log_max_bytes)
 
   defp log_keep_count,
     do: Application.get_env(:greengrass_lite, :daemon_log_keep, @default_log_keep)
+
+  defp always_on_log?(name) do
+    name in
+      Application.get_env(
+        :greengrass_lite,
+        :always_on_log_daemons,
+        @default_always_on_log_daemons
+      )
+  end
+
+  defp logs_enabled_for?(name) do
+    always_on_log?(name) or GreenGrassLite.Control.logs_enabled?()
+  end
 
   defstruct [:name, :bin, :args, :port, :os_pid, :log_io, :log_path, log_size: 0]
 
@@ -56,6 +82,17 @@ defmodule GreenGrassLite.Daemon do
     case GenServer.whereis(via(name)) do
       nil -> false
       pid -> GenServer.call(pid, :alive?)
+    end
+  end
+
+  @doc """
+  Reopen or close the daemon's log file based on `GreenGrassLite.Control.logs_enabled?/0`.
+  No-op if the daemon GenServer is not running.
+  """
+  def reload_logs(name) do
+    case GenServer.whereis(via(name)) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, :reload_logs)
     end
   end
 
@@ -154,6 +191,31 @@ defmodule GreenGrassLite.Daemon do
     {:noreply, state}
   end
 
+  @impl true
+  def handle_cast(:reload_logs, %{name: name, log_io: io} = state) do
+    enabled? = logs_enabled_for?(name)
+    has_log? = io != nil
+
+    cond do
+      enabled? and not has_log? ->
+        {new_io, new_path, new_size} = open_daemon_log_file(name)
+
+        if new_io != nil do
+          Logger.info("GREENGRASS_LITE_DAEMON_LOG_OPENED #{name} path=#{new_path}")
+        end
+
+        {:noreply, %{state | log_io: new_io, log_path: new_path, log_size: new_size}}
+
+      not enabled? and has_log? ->
+        close_log_io(io)
+        Logger.info("GREENGRASS_LITE_DAEMON_LOG_CLOSED #{name}")
+        {:noreply, %{state | log_io: nil, log_path: nil, log_size: 0}}
+
+      true ->
+        {:noreply, state}
+    end
+  end
+
   defp spawn_daemon_port(name, bin, args) do
     {log_io, log_path, log_size} = open_daemon_log(name)
 
@@ -235,6 +297,14 @@ defmodule GreenGrassLite.Daemon do
   end
 
   defp open_daemon_log(name) do
+    if logs_enabled_for?(name) do
+      open_daemon_log_file(name)
+    else
+      {nil, nil, 0}
+    end
+  end
+
+  defp open_daemon_log_file(name) do
     dir = log_dir()
     File.mkdir_p!(dir)
     path = Path.join(dir, "#{Atom.to_string(name)}.log")

@@ -6,14 +6,20 @@ defmodule GreenGrassLite.Control do
   Override path in tests or custom images:
 
       config :greengrass_lite, control_file: \"/data/.greengrass_control.txt\"
+      config :greengrass_lite, logs_control_file: \"/data/.greengrass_logs_control.txt\"
   """
 
   require Logger
 
   @default_control_file "/root/.greengrass_control.txt"
+  @default_logs_control_file "/root/.greengrass_logs_control.txt"
 
   defp control_file_path do
     Application.get_env(:greengrass_lite, :control_file, @default_control_file)
+  end
+
+  defp logs_control_file_path do
+    Application.get_env(:greengrass_lite, :logs_control_file, @default_logs_control_file)
   end
 
   @doc """
@@ -66,6 +72,65 @@ defmodule GreenGrassLite.Control do
   """
   def enabled? do
     status() != :disabled
+  end
+
+  @doc """
+  Returns daemon-log status: `:enabled`, `:disabled`, or `:unknown`.
+
+  Defaults to `:disabled` when the control file is missing — daemon stdout/stderr
+  logs are off unless explicitly enabled (saves disk I/O / wear on the vending unit).
+  """
+  def logs_status do
+    case File.read(logs_control_file_path()) do
+      {:ok, content} ->
+        content = String.trim(content)
+
+        cond do
+          content in ["1", "enabled"] -> :enabled
+          content in ["0", "disabled"] -> :disabled
+          true -> :unknown
+        end
+
+      {:error, :enoent} ->
+        :disabled
+
+      {:error, reason} ->
+        Logger.warning("GREENGRASS_LITE_LOGS_CONTROL_READ_ERROR #{inspect(reason)}")
+        :unknown
+    end
+  end
+
+  @doc """
+  Returns true only if the logs control file explicitly enables daemon logs.
+  """
+  def logs_enabled?, do: logs_status() == :enabled
+
+  @doc """
+  Enables daemon stdout/stderr logging and reopens log files in any running daemons.
+  """
+  @spec enable_logs() :: :ok | {:error, File.posix() | :badarg | :terminated}
+  def enable_logs do
+    with :ok <- File.write(logs_control_file_path(), "enabled") do
+      reload_daemon_logs()
+      :ok
+    end
+  end
+
+  @doc """
+  Disables daemon stdout/stderr logging and closes log files in any running daemons.
+  """
+  @spec disable_logs() :: :ok | {:error, File.posix() | :badarg | :terminated}
+  def disable_logs do
+    with :ok <- File.write(logs_control_file_path(), "disabled") do
+      reload_daemon_logs()
+      :ok
+    end
+  end
+
+  defp reload_daemon_logs do
+    daemon_status()
+    |> Map.keys()
+    |> Enum.each(&GreenGrassLite.Daemon.reload_logs/1)
   end
 
   @doc """

@@ -11,6 +11,12 @@ defmodule GreenGrassLite.Daemon do
       config :greengrass_lite, forward_daemon_log_level: :info
       # when forwarding, skip C lines starting with T[ / D[ (trace/debug), e.g. MQTT pings
       config :greengrass_lite, forward_daemon_logs_skip_c_debug: true
+
+  Daemon logs are rotated by size to bound disk usage. Defaults: 5 MB per
+  file, 1 archived generation (`<name>.log` + `<name>.log.1`). Override with:
+
+      config :greengrass_lite, daemon_log_max_bytes: 5 * 1024 * 1024
+      config :greengrass_lite, daemon_log_keep: 1
   """
 
   use GenServer
@@ -27,7 +33,16 @@ defmodule GreenGrassLite.Daemon do
   @gg_config_wait_attempts 300
   @gg_config_poll_ms 50
 
-  defstruct [:name, :bin, :args, :port, :os_pid, :log_io]
+  @default_log_max_bytes 5 * 1024 * 1024
+  @default_log_keep 1
+
+  defp log_max_bytes,
+    do: Application.get_env(:greengrass_lite, :daemon_log_max_bytes, @default_log_max_bytes)
+
+  defp log_keep_count,
+    do: Application.get_env(:greengrass_lite, :daemon_log_keep, @default_log_keep)
+
+  defstruct [:name, :bin, :args, :port, :os_pid, :log_io, :log_path, log_size: 0]
 
   def start_link({name, bin, args}) do
     GenServer.start_link(__MODULE__, {name, bin, args}, name: via(name))
@@ -56,7 +71,7 @@ defmodule GreenGrassLite.Daemon do
 
         if name == :ggconfigd do
           case spawn_daemon_port(name, bin, args) do
-            {:ok, port, os_pid, log_io, log_path} ->
+            {:ok, port, os_pid, log_io, log_path, log_size} ->
               wait_for_gg_config_socket(@gg_config_wait_attempts)
               log_started(name, os_pid, log_path)
 
@@ -67,7 +82,9 @@ defmodule GreenGrassLite.Daemon do
                  args: args,
                  port: port,
                  os_pid: os_pid,
-                 log_io: log_io
+                 log_io: log_io,
+                 log_path: log_path,
+                 log_size: log_size
                }}
 
             :error ->
@@ -91,9 +108,18 @@ defmodule GreenGrassLite.Daemon do
       {:noreply, state}
     else
       case spawn_daemon_port(name, bin, args) do
-        {:ok, port, os_pid, log_io, log_path} ->
+        {:ok, port, os_pid, log_io, log_path, log_size} ->
           log_started(name, os_pid, log_path)
-          {:noreply, %{state | port: port, os_pid: os_pid, log_io: log_io}}
+
+          {:noreply,
+           %{
+             state
+             | port: port,
+               os_pid: os_pid,
+               log_io: log_io,
+               log_path: log_path,
+               log_size: log_size
+           }}
 
         :error ->
           {:noreply, state}
@@ -103,9 +129,11 @@ defmodule GreenGrassLite.Daemon do
 
   @impl true
   def handle_info({port, {:data, data}}, %{port: port, name: name} = state) do
-    write_daemon_log(name, state.log_io, data)
+    {new_io, new_size} =
+      write_daemon_log(name, state.log_io, state.log_path, state.log_size, data)
+
     log_daemon_lines(name, data)
-    {:noreply, state}
+    {:noreply, %{state | log_io: new_io, log_size: new_size}}
   end
 
   @impl true
@@ -127,7 +155,7 @@ defmodule GreenGrassLite.Daemon do
   end
 
   defp spawn_daemon_port(name, bin, args) do
-    {log_io, log_path} = open_daemon_log(name)
+    {log_io, log_path, log_size} = open_daemon_log(name)
 
     port =
       Port.open({:spawn_executable, bin}, [
@@ -141,7 +169,7 @@ defmodule GreenGrassLite.Daemon do
 
     case Port.info(port, :os_pid) do
       {:os_pid, os_pid} ->
-        {:ok, port, os_pid, log_io, log_path}
+        {:ok, port, os_pid, log_io, log_path, log_size}
 
       _ ->
         :error
@@ -211,39 +239,122 @@ defmodule GreenGrassLite.Daemon do
     File.mkdir_p!(dir)
     path = Path.join(dir, "#{Atom.to_string(name)}.log")
 
+    initial_size = file_size(path)
+
+    size =
+      if initial_size >= log_max_bytes() do
+        rotate_log_file(path)
+        Logger.info("GREENGRASS_LITE_DAEMON_LOG_ROTATED #{name} path=#{path} reason=size_at_open")
+        0
+      else
+        initial_size
+      end
+
     case File.open(path, [:append, :binary]) do
       {:ok, io} ->
-        {io, path}
+        {io, path, size}
 
       {:error, reason} ->
         Logger.warning(
           "GREENGRASS_LITE_DAEMON_LOG_OPEN_FAILED #{name} path=#{path} reason=#{inspect(reason)}"
         )
 
-        {nil, nil}
+        {nil, nil, 0}
     end
   end
 
-  defp write_daemon_log(_name, nil, _data), do: :ok
+  defp file_size(path) do
+    case File.stat(path) do
+      {:ok, %{size: s}} -> s
+      _ -> 0
+    end
+  end
+
+  # Shifts <path>.log -> <path>.log.1 -> <path>.log.2 ... up to log_keep_count/0,
+  # discarding the oldest archive (so disk usage stays bounded).
+  defp rotate_log_file(path) do
+    keep = log_keep_count()
+
+    if keep <= 0 do
+      _ = File.rm(path)
+    else
+      _ = File.rm("#{path}.#{keep}")
+
+      keep..2//-1
+      |> Enum.each(fn n ->
+        src = "#{path}.#{n - 1}"
+        if File.exists?(src), do: _ = File.rename(src, "#{path}.#{n}")
+      end)
+
+      if File.exists?(path), do: _ = File.rename(path, "#{path}.1")
+    end
+
+    :ok
+  end
+
+  defp write_daemon_log(_name, nil, _path, _size, _data), do: {nil, 0}
 
   # Use :file.write/2 instead of IO.binwrite/2: the latter raises on {:error, reason}
   # (e.g. :enospc when /home/ggc_user or the log volume is full), which kills the GenServer
   # and restarts daemons in a tight loop without fixing the underlying disk issue.
-  defp write_daemon_log(name, io, data) when is_binary(data) do
+  defp write_daemon_log(name, io, path, size, data) when is_binary(data) do
     case :file.write(io, data) do
       :ok ->
-        :ok
+        maybe_rotate(name, io, path, size + byte_size(data))
 
       {:error, :enospc} ->
         log_enospc_once(name)
-        :ok
+        # Best-effort recovery: rotation deletes the oldest archive, which usually
+        # frees enough space to keep logging. If it still fails, fall back to the
+        # old behavior of dropping chunks until disk space is freed.
+        emergency_rotate(name, io, path)
 
       {:error, reason} ->
         Logger.warning(
           "GREENGRASS_LITE_DAEMON_LOG_WRITE_FAILED daemon=#{name} reason=#{inspect(reason)}"
         )
 
-        :ok
+        {io, size}
+    end
+  end
+
+  defp maybe_rotate(name, io, path, new_size) do
+    if new_size >= log_max_bytes() do
+      close_log_io(io)
+      rotate_log_file(path)
+      Logger.info("GREENGRASS_LITE_DAEMON_LOG_ROTATED #{name} path=#{path} reason=size")
+      reopen_after_rotate(name, path)
+    else
+      {io, new_size}
+    end
+  end
+
+  defp emergency_rotate(name, io, path) do
+    close_log_io(io)
+    rotate_log_file(path)
+
+    case File.open(path, [:append, :binary]) do
+      {:ok, new_io} ->
+        Logger.info("GREENGRASS_LITE_DAEMON_LOG_ROTATED #{name} path=#{path} reason=enospc")
+        Process.delete({:greengrass_lite_daemon, :enospc_logged, name})
+        {new_io, 0}
+
+      {:error, _reason} ->
+        {nil, 0}
+    end
+  end
+
+  defp reopen_after_rotate(name, path) do
+    case File.open(path, [:append, :binary]) do
+      {:ok, new_io} ->
+        {new_io, 0}
+
+      {:error, reason} ->
+        Logger.warning(
+          "GREENGRASS_LITE_DAEMON_LOG_REOPEN_FAILED #{name} path=#{path} reason=#{inspect(reason)}"
+        )
+
+        {nil, 0}
     end
   end
 

@@ -1,6 +1,9 @@
 defmodule GreenGrassLite.Daemon do
   @moduledoc """
-  GenServer that manages a single greengrass-lite daemon process via `Port`.
+  GenServer that manages a single greengrass-lite daemon through a MuonTrap port.
+
+  MuonTrap terminates the OS daemon even if its Elixir owner crashes without
+  running `terminate/2`. `monitor_os_pid` identifies MuonTrap, not the daemon.
 
   Daemon stdout/stderr is **disabled by default** — `GreenGrassLite.Control.logs_status/0`
   must be `:enabled` for chunks to be written to `<ggc_root>/logs/<name>.log`
@@ -33,6 +36,7 @@ defmodule GreenGrassLite.Daemon do
 
   use GenServer
   require Logger
+  alias GreenGrassLite.DaemonProcess
 
   defp ggc_root do
     Application.get_env(:greengrass_lite, :ggc_root, "/home/ggc_user")
@@ -45,6 +49,9 @@ defmodule GreenGrassLite.Daemon do
   @gg_config_wait_attempts 300
   @gg_config_poll_ms 50
 
+  defp gg_config_socket,
+    do: Application.get_env(:greengrass_lite, :gg_config_socket, @gg_config_socket)
+
   @default_log_max_bytes 5 * 1024 * 1024
   @default_log_keep 1
   @default_always_on_log_daemons [:iotcored]
@@ -56,19 +63,18 @@ defmodule GreenGrassLite.Daemon do
     do: Application.get_env(:greengrass_lite, :daemon_log_keep, @default_log_keep)
 
   defp always_on_log?(name) do
-    name in
-      Application.get_env(
-        :greengrass_lite,
-        :always_on_log_daemons,
-        @default_always_on_log_daemons
-      )
+    name in Application.get_env(
+      :greengrass_lite,
+      :always_on_log_daemons,
+      @default_always_on_log_daemons
+    )
   end
 
   defp logs_enabled_for?(name) do
     always_on_log?(name) or GreenGrassLite.Control.logs_enabled?()
   end
 
-  defstruct [:name, :bin, :args, :port, :os_pid, :log_io, :log_path, log_size: 0]
+  defstruct [:name, :bin, :args, :port, :monitor_os_pid, :log_io, :log_path, log_size: 0]
 
   def start_link({name, bin, args}) do
     GenServer.start_link(__MODULE__, {name, bin, args}, name: via(name))
@@ -108,21 +114,32 @@ defmodule GreenGrassLite.Daemon do
 
         if name == :ggconfigd do
           case spawn_daemon_port(name, bin, args) do
-            {:ok, port, os_pid, log_io, log_path, log_size} ->
-              wait_for_gg_config_socket(@gg_config_wait_attempts)
-              log_started(name, os_pid, log_path)
+            {:ok, port, monitor_os_pid, log_io, log_path, log_size} ->
+              state = %__MODULE__{
+                name: name,
+                bin: bin,
+                args: args,
+                port: port,
+                monitor_os_pid: monitor_os_pid,
+                log_io: log_io,
+                log_path: log_path,
+                log_size: log_size
+              }
 
-              {:ok,
-               %__MODULE__{
-                 name: name,
-                 bin: bin,
-                 args: args,
-                 port: port,
-                 os_pid: os_pid,
-                 log_io: log_io,
-                 log_path: log_path,
-                 log_size: log_size
-               }}
+              deadline =
+                System.monotonic_time(:millisecond) +
+                  @gg_config_wait_attempts * @gg_config_poll_ms
+
+              case wait_for_gg_config_socket(state, deadline) do
+                {:ok, state} ->
+                  log_started(name, monitor_os_pid, log_path)
+                  {:ok, state}
+
+                {:error, reason, state} ->
+                  DaemonProcess.close(state.port, state.monitor_os_pid)
+                  close_log_io(state.log_io)
+                  {:stop, reason}
+              end
 
             :error ->
               {:ok, %__MODULE__{name: name, bin: bin, args: args}}
@@ -139,20 +156,25 @@ defmodule GreenGrassLite.Daemon do
   end
 
   @impl true
+  def handle_info(:start_daemon, %{port: port} = state) when port != nil do
+    # A wakeup cannot replace ownership of an already running OS process.
+    {:noreply, state}
+  end
+
   def handle_info(:start_daemon, %{bin: bin, args: args, name: name} = state) do
     unless File.exists?(bin) do
       Logger.warning("GREENGRASS_LITE_DAEMON_BIN_NOT_FOUND #{name} #{bin}")
       {:noreply, state}
     else
       case spawn_daemon_port(name, bin, args) do
-        {:ok, port, os_pid, log_io, log_path, log_size} ->
-          log_started(name, os_pid, log_path)
+        {:ok, port, monitor_os_pid, log_io, log_path, log_size} ->
+          log_started(name, monitor_os_pid, log_path)
 
           {:noreply,
            %{
              state
              | port: port,
-               os_pid: os_pid,
+               monitor_os_pid: monitor_os_pid,
                log_io: log_io,
                log_path: log_path,
                log_size: log_size
@@ -165,24 +187,20 @@ defmodule GreenGrassLite.Daemon do
   end
 
   @impl true
-  def handle_info({port, {:data, data}}, %{port: port, name: name} = state) do
-    {new_io, new_size} =
-      write_daemon_log(name, state.log_io, state.log_path, state.log_size, data)
-
-    log_daemon_lines(name, data)
-    {:noreply, %{state | log_io: new_io, log_size: new_size}}
+  def handle_info({port, {:data, data}}, %{port: port} = state) do
+    {:noreply, consume_output(state, data)}
   end
 
   @impl true
   def handle_info({port, {:exit_status, status}}, %{port: port, name: name} = state) do
     Logger.warning("GREENGRASS_LITE_DAEMON_EXITED #{name} status=#{status}")
-    {:stop, {:daemon_exit, status}, %{state | port: nil, os_pid: nil}}
+    {:stop, {:daemon_exit, status}, %{state | port: nil, monitor_os_pid: nil}}
   end
 
   @impl true
   def handle_info({:EXIT, port, reason}, %{port: port, name: name} = state) do
     Logger.warning("GREENGRASS_LITE_DAEMON_PORT_EXIT #{name} reason=#{inspect(reason)}")
-    {:stop, reason, %{state | port: nil, os_pid: nil}}
+    {:stop, reason, %{state | port: nil, monitor_os_pid: nil}}
   end
 
   @impl true
@@ -219,46 +237,68 @@ defmodule GreenGrassLite.Daemon do
   defp spawn_daemon_port(name, bin, args) do
     {log_io, log_path, log_size} = open_daemon_log(name)
 
-    port =
-      Port.open({:spawn_executable, bin}, [
-        :binary,
-        :exit_status,
-        :use_stdio,
-        :stderr_to_stdout,
-        cd: String.to_charlist(work_dir()),
-        args: args
-      ])
-
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} ->
-        {:ok, port, os_pid, log_io, log_path, log_size}
+    case DaemonProcess.open(bin, args, work_dir()) do
+      {:ok, port, monitor_os_pid} ->
+        {:ok, port, monitor_os_pid, log_io, log_path, log_size}
 
       _ ->
+        close_log_io(log_io)
         :error
     end
   end
 
-  defp log_started(name, os_pid, log_path) do
+  defp log_started(name, monitor_os_pid, log_path) do
     if log_path do
-      Logger.info("GREENGRASS_LITE_DAEMON_STARTED #{name} pid=#{os_pid} log=#{log_path}")
+      Logger.info(
+        "GREENGRASS_LITE_DAEMON_STARTED #{name} monitor_pid=#{monitor_os_pid} log=#{log_path}"
+      )
     else
-      Logger.info("GREENGRASS_LITE_DAEMON_STARTED #{name} pid=#{os_pid}")
+      Logger.info("GREENGRASS_LITE_DAEMON_STARTED #{name} monitor_pid=#{monitor_os_pid}")
     end
   end
 
-  defp wait_for_gg_config_socket(0) do
-    Logger.warning(
-      "GREENGRASS_LITE_GGCONFIG_SOCKET_WAIT_TIMEOUT path=#{@gg_config_socket} after #{@gg_config_wait_attempts * @gg_config_poll_ms}ms"
-    )
+  defp wait_for_gg_config_socket(%{port: port} = state, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+    socket = gg_config_socket()
+
+    cond do
+      File.exists?(socket) ->
+        Logger.debug("GREENGRASS_LITE_GGCONFIG_SOCKET_READY #{socket}")
+        {:ok, state}
+
+      remaining <= 0 ->
+        Logger.warning(
+          "GREENGRASS_LITE_GGCONFIG_SOCKET_WAIT_TIMEOUT path=#{socket} after #{@gg_config_wait_attempts * @gg_config_poll_ms}ms"
+        )
+
+        {:ok, state}
+
+      true ->
+        # Drain and acknowledge logs during init too, so output cannot block
+        # ggconfigd before it creates the socket required by the other daemons.
+        receive do
+          {^port, {:data, data}} ->
+            wait_for_gg_config_socket(consume_output(state, data), deadline)
+
+          {^port, {:exit_status, status}} ->
+            {:error, {:daemon_exit, status}, state}
+
+          {:EXIT, ^port, reason} ->
+            {:error, {:daemon_port_exit, reason}, state}
+        after
+          min(remaining, @gg_config_poll_ms) -> wait_for_gg_config_socket(state, deadline)
+        end
+    end
   end
 
-  defp wait_for_gg_config_socket(n) when n > 0 do
-    if File.exists?(@gg_config_socket) do
-      Logger.debug("GREENGRASS_LITE_GGCONFIG_SOCKET_READY #{@gg_config_socket}")
-    else
-      Process.sleep(@gg_config_poll_ms)
-      wait_for_gg_config_socket(n - 1)
-    end
+  defp consume_output(%{port: port, name: name} = state, data) do
+    DaemonProcess.acknowledge(port, data)
+
+    {new_io, new_size} =
+      write_daemon_log(name, state.log_io, state.log_path, state.log_size, data)
+
+    log_daemon_lines(name, data)
+    %{state | log_io: new_io, log_size: new_size}
   end
 
   @impl true
@@ -267,8 +307,8 @@ defmodule GreenGrassLite.Daemon do
   end
 
   def handle_call(:stop, _from, %{port: port} = state) when port != nil do
-    Port.close(port)
-    {:stop, :normal, :ok, %{state | port: nil, os_pid: nil}}
+    result = DaemonProcess.close(port, state.monitor_os_pid)
+    {:stop, :normal, result, %{state | port: nil, monitor_os_pid: nil}}
   end
 
   def handle_call(:stop, _from, state) do
@@ -276,17 +316,11 @@ defmodule GreenGrassLite.Daemon do
   end
 
   @impl true
-  def terminate(_reason, %{port: port, name: name, log_io: log_io}) do
+  def terminate(_reason, %{port: port, monitor_os_pid: monitor_os_pid, name: name, log_io: log_io}) do
     Logger.debug("GREENGRASS_LITE_DAEMON_TERMINATING #{name}")
     close_log_io(log_io)
 
-    if port != nil do
-      try do
-        Port.close(port)
-      rescue
-        _ -> :ok
-      end
-    end
+    DaemonProcess.close(port, monitor_os_pid)
 
     :ok
   end

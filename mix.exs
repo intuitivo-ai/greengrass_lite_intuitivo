@@ -23,7 +23,7 @@ defmodule GreenGrassLite.MixProject do
 
   defp deps do
     [
-      {:muontrap, "~> 1.0"},
+      {:muontrap, "~> 1.7"},
       {:yaml_elixir, "~> 2.9"},
       {:jason, "~> 1.4"}
     ]
